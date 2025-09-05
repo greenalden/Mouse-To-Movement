@@ -56,6 +56,8 @@ pip install pyautogui
 pip install pyautogui keyboard
 pip install pynput
 pip install vgamepad
+pip install pyautogui pynput vgamepad numpy
+pip install scipy
 
 
 
