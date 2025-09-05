@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import pyautogui
 import threading
 import time
@@ -9,11 +9,30 @@ from pynput import keyboard
 import numpy as np
 from scipy import interpolate
 import platform
+import json
+import os
+from pathlib import Path
 
 class MouseToGamepadGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Mouse to Xbox Controller - Advanced")
+        
+        # Settings file path
+        self.settings_file = Path.home() / "mouse_gamepad_settings.json"
+        
+        # Default settings
+        self.default_settings = {
+            'sensitivity': 50,
+            'decay_rate': 0.85,
+            'deadzone': 0.05,
+            'smoothing': 0.3,  # Increased default for more noticeable effect
+            'x_axis_enabled': True,
+            'y_axis_enabled': True,
+            'invert_x': False,
+            'invert_y': False,
+            'control_points': [(0, 0), (0.25, 0.25), (0.5, 0.5), (0.75, 0.75), (1.0, 1.0)]
+        }
         
         # Get screen dimensions and set appropriate window size
         screen_width = self.root.winfo_screenwidth()
@@ -36,22 +55,27 @@ class MouseToGamepadGUI:
         # Initialize gamepad
         self.gamepad = vg.VX360Gamepad()
         
-        # Control variables
+        # Control variables - will be loaded from settings
         self.running = False
         self.paused = False
-        self.sensitivity = tk.DoubleVar(value=50)
-        self.decay_rate = tk.DoubleVar(value=0.85)
-        self.deadzone = tk.DoubleVar(value=0.05)
-        self.x_axis_enabled = tk.BooleanVar(value=True)
-        self.y_axis_enabled = tk.BooleanVar(value=True)
-        self.invert_x = tk.BooleanVar(value=False)
-        self.invert_y = tk.BooleanVar(value=False)
+        self.sensitivity = tk.DoubleVar()
+        self.decay_rate = tk.DoubleVar()
+        self.deadzone = tk.DoubleVar()
+        self.smoothing = tk.DoubleVar()  # Added smoothing variable
+        self.x_axis_enabled = tk.BooleanVar()
+        self.y_axis_enabled = tk.BooleanVar()
+        self.invert_x = tk.BooleanVar()
+        self.invert_y = tk.BooleanVar()
         
         # Joystick position tracking
         self.joystick_x = 0.0
         self.joystick_y = 0.0
         self.raw_x = 0.0
         self.raw_y = 0.0
+        
+        # Smoothing buffers
+        self.smooth_x = 0.0
+        self.smooth_y = 0.0
         
         # Mouse tracking
         self.screen_w, self.screen_h = pyautogui.size()
@@ -60,22 +84,117 @@ class MouseToGamepadGUI:
         self.last_mx = self.center_x
         self.last_my = self.center_y
         
-        # Response curve control points
-        self.control_points = [(0, 0), (0.25, 0.25), (0.5, 0.5), (0.75, 0.75), (1.0, 1.0)]
+        # Response curve control points - will be loaded from settings
+        self.control_points = []
         self.selected_point = None
         self.spline = None
+        
+        # Load settings first
+        self.load_settings()
         
         # Setup GUI with proper scrolling
         self.setup_gui()
         
-        # Calculate initial spline
-        self.update_spline()
+        # Calculate initial spline after a short delay to ensure GUI is ready
+        self.root.after(100, self.initialize_curve)
         
         # Start update loop for display
         self.update_display()
         
         # Keyboard listener
         self.keyboard_listener = None
+        
+        # Auto-save timer
+        self.auto_save_after_id = None
+        
+    def load_settings(self):
+        """Load settings from file, use defaults if file doesn't exist"""
+        try:
+            if self.settings_file.exists():
+                with open(self.settings_file, 'r') as f:
+                    settings = json.load(f)
+                
+                # Validate and apply settings
+                self.sensitivity.set(settings.get('sensitivity', self.default_settings['sensitivity']))
+                self.decay_rate.set(settings.get('decay_rate', self.default_settings['decay_rate']))
+                self.deadzone.set(settings.get('deadzone', self.default_settings['deadzone']))
+                self.smoothing.set(settings.get('smoothing', self.default_settings['smoothing']))  # Added smoothing
+                self.x_axis_enabled.set(settings.get('x_axis_enabled', self.default_settings['x_axis_enabled']))
+                self.y_axis_enabled.set(settings.get('y_axis_enabled', self.default_settings['y_axis_enabled']))
+                self.invert_x.set(settings.get('invert_x', self.default_settings['invert_x']))
+                self.invert_y.set(settings.get('invert_y', self.default_settings['invert_y']))
+                
+                # Load control points with validation
+                control_points = settings.get('control_points', self.default_settings['control_points'])
+                if len(control_points) >= 2 and all(isinstance(p, list) and len(p) == 2 for p in control_points):
+                    self.control_points = [(float(p[0]), float(p[1])) for p in control_points]
+                else:
+                    self.control_points = self.default_settings['control_points'].copy()
+                    
+                print(f"Settings loaded from {self.settings_file}")
+            else:
+                # Use default settings
+                self.apply_default_settings()
+                print("No settings file found, using defaults")
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            self.apply_default_settings()
+    
+    def apply_default_settings(self):
+        """Apply default settings to variables"""
+        self.sensitivity.set(self.default_settings['sensitivity'])
+        self.decay_rate.set(self.default_settings['decay_rate'])
+        self.deadzone.set(self.default_settings['deadzone'])
+        self.smoothing.set(self.default_settings['smoothing'])  # Added smoothing
+        self.x_axis_enabled.set(self.default_settings['x_axis_enabled'])
+        self.y_axis_enabled.set(self.default_settings['y_axis_enabled'])
+        self.invert_x.set(self.default_settings['invert_x'])
+        self.invert_y.set(self.default_settings['invert_y'])
+        self.control_points = self.default_settings['control_points'].copy()
+    
+    def save_settings(self):
+        """Save current settings to file"""
+        try:
+            settings = {
+                'sensitivity': self.sensitivity.get(),
+                'decay_rate': self.decay_rate.get(),
+                'deadzone': self.deadzone.get(),
+                'smoothing': self.smoothing.get(),  # Added smoothing
+                'x_axis_enabled': self.x_axis_enabled.get(),
+                'y_axis_enabled': self.y_axis_enabled.get(),
+                'invert_x': self.invert_x.get(),
+                'invert_y': self.invert_y.get(),
+                'control_points': [[p[0], p[1]] for p in self.control_points]
+            }
+            
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+                
+            print(f"Settings saved to {self.settings_file}")
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+    
+    def schedule_auto_save(self):
+        """Schedule an auto-save after a delay"""
+        if self.auto_save_after_id:
+            self.root.after_cancel(self.auto_save_after_id)
+        self.auto_save_after_id = self.root.after(1000, self.save_settings)  # Save after 1 second delay
+    
+    def reset_to_defaults(self):
+        """Reset all settings to defaults"""
+        if messagebox.askyesno("Reset Settings", 
+                             "Are you sure you want to reset all settings to defaults?\n\nThis will:\n- Reset all sliders\n- Reset axis settings\n- Reset response curve\n- This cannot be undone!"):
+            self.apply_default_settings()
+            self.update_spline()
+            self.draw_curve()
+            self.draw_joystick_background()
+            self.schedule_auto_save()
+            print("Settings reset to defaults")
+    
+    def initialize_curve(self):
+        """Initialize the curve after GUI is ready"""
+        self.update_spline()
+        self.draw_curve()
         
     def setup_gui(self):
         # Create main container with scrollbar
@@ -194,10 +313,17 @@ class MouseToGamepadGUI:
         tk.Label(sens_btn_frame, text="[/]", bg='#2a2a2a', fg='#777', 
                 font=('Arial', 8)).pack(side=tk.LEFT, padx=3)
         
-        # Quit
-        tk.Button(hotkey_frame, text="⏹ QUIT [ESC]", command=self.quit_app,
-                 bg='#f44336', fg='white', font=('Arial', 9),
-                 width=14).pack(pady=3)
+        # Reset and Quit buttons
+        reset_quit_frame = tk.Frame(hotkey_frame, bg='#2a2a2a')
+        reset_quit_frame.pack(pady=3, fill=tk.X)
+        
+        tk.Button(reset_quit_frame, text="🔄 RESET", command=self.reset_to_defaults,
+                 bg='#FF9800', fg='white', font=('Arial', 8),
+                 width=7).pack(side=tk.LEFT, padx=1)
+        
+        tk.Button(reset_quit_frame, text="❌ QUIT", command=self.quit_app,
+                 bg='#f44336', fg='white', font=('Arial', 8),
+                 width=7).pack(side=tk.LEFT, padx=1)
         
         # MIDDLE: Axis Control
         axis_frame = tk.LabelFrame(top_frame, text="Axis Control", bg='#2a2a2a', fg='#ffffff', 
@@ -224,11 +350,13 @@ class MouseToGamepadGUI:
         
         tk.Checkbutton(axis_frame, text="Invert X", variable=self.invert_x,
                       bg='#2a2a2a', fg='#fa0', activebackground='#2a2a2a',
-                      selectcolor='#1a1a1a', font=('Arial', 9)).pack(pady=2)
+                      selectcolor='#1a1a1a', font=('Arial', 9),
+                      command=self.schedule_auto_save).pack(pady=2)
         
         tk.Checkbutton(axis_frame, text="Invert Y", variable=self.invert_y,
                       bg='#2a2a2a', fg='#fa0', activebackground='#2a2a2a',
-                      selectcolor='#1a1a1a', font=('Arial', 9)).pack(pady=2)
+                      selectcolor='#1a1a1a', font=('Arial', 9),
+                      command=self.schedule_auto_save).pack(pady=2)
         
         # RIGHT: Joystick visualization
         joystick_frame = tk.LabelFrame(top_frame, text="Joystick Position", bg='#2a2a2a', fg='#ffffff', 
@@ -266,7 +394,8 @@ class MouseToGamepadGUI:
                 font=('Arial', 9), width=10, anchor='w').grid(row=0, column=0, sticky='w')
         self.sens_slider = tk.Scale(param_grid, from_=2, to=100, orient=tk.HORIZONTAL, 
                                     variable=self.sensitivity, bg='#3a3a3a', fg='#fff',
-                                    highlightthickness=0, length=200)
+                                    highlightthickness=0, length=200,
+                                    command=lambda v: self.schedule_auto_save())
         self.sens_slider.grid(row=0, column=1, padx=5)
         self.sens_value = tk.Label(param_grid, text="50", bg='#2a2a2a', fg='#0f0', width=5)
         self.sens_value.grid(row=0, column=2)
@@ -276,7 +405,8 @@ class MouseToGamepadGUI:
                 font=('Arial', 9), width=10, anchor='w').grid(row=1, column=0, sticky='w')
         self.decay_slider = tk.Scale(param_grid, from_=0.5, to=0.99, resolution=0.01, 
                                      orient=tk.HORIZONTAL, variable=self.decay_rate, 
-                                     bg='#3a3a3a', fg='#fff', highlightthickness=0, length=200)
+                                     bg='#3a3a3a', fg='#fff', highlightthickness=0, length=200,
+                                     command=lambda v: self.schedule_auto_save())
         self.decay_slider.grid(row=1, column=1, padx=5)
         self.decay_value = tk.Label(param_grid, text="0.85", bg='#2a2a2a', fg='#0f0', width=5)
         self.decay_value.grid(row=1, column=2)
@@ -286,10 +416,22 @@ class MouseToGamepadGUI:
                 font=('Arial', 9), width=10, anchor='w').grid(row=2, column=0, sticky='w')
         self.dead_slider = tk.Scale(param_grid, from_=0, to=0.2, resolution=0.01, 
                                     orient=tk.HORIZONTAL, variable=self.deadzone, 
-                                    bg='#3a3a3a', fg='#fff', highlightthickness=0, length=200)
+                                    bg='#3a3a3a', fg='#fff', highlightthickness=0, length=200,
+                                    command=lambda v: self.schedule_auto_save())
         self.dead_slider.grid(row=2, column=1, padx=5)
         self.dead_value = tk.Label(param_grid, text="0.05", bg='#2a2a2a', fg='#0f0', width=5)
         self.dead_value.grid(row=2, column=2)
+        
+        # Smoothing - Updated slider range
+        tk.Label(param_grid, text="Smoothing:", bg='#2a2a2a', fg='#fff', 
+                font=('Arial', 9), width=10, anchor='w').grid(row=3, column=0, sticky='w')
+        self.smooth_slider = tk.Scale(param_grid, from_=0, to=0.95, resolution=0.01, 
+                                    orient=tk.HORIZONTAL, variable=self.smoothing, 
+                                    bg='#3a3a3a', fg='#fff', highlightthickness=0, length=200,
+                                    command=lambda v: self.schedule_auto_save())
+        self.smooth_slider.grid(row=3, column=1, padx=5)
+        self.smooth_value = tk.Label(param_grid, text="0.30", bg='#2a2a2a', fg='#0f0', width=5)
+        self.smooth_value.grid(row=3, column=2)
         
         # Response Curve Editor
         curve_container = tk.LabelFrame(main_frame, text="Response Curve Editor (Drag Points)", 
@@ -321,10 +463,9 @@ class MouseToGamepadGUI:
         self.curve_canvas.bind('<ButtonRelease-1>', self.on_curve_release)
         
         self.draw_curve_background()
-        self.draw_curve()
         
         # Info
-        info_text = "Scroll with mouse wheel • Drag curve points • All hotkeys work when unfocused"
+        info_text = "Auto-saves settings • Scroll with mouse wheel • Drag curve points • All hotkeys work when unfocused"
         tk.Label(main_frame, text=info_text, bg='#1e1e1e', fg='#888', 
                 font=('Arial', 8)).pack(pady=(5, 0))
     
@@ -355,30 +496,33 @@ class MouseToGamepadGUI:
         w, h = 350, 280
         margin = 35
         
+        # Clear and redraw background
+        self.curve_canvas.delete("background")
+        
         # Axes
-        self.curve_canvas.create_line(margin, h-margin, w-margin, h-margin, fill='#666', width=2)
-        self.curve_canvas.create_line(margin, h-margin, margin, margin, fill='#666', width=2)
+        self.curve_canvas.create_line(margin, h-margin, w-margin, h-margin, fill='#666', width=2, tags="background")
+        self.curve_canvas.create_line(margin, h-margin, margin, margin, fill='#666', width=2, tags="background")
         
         # Grid
         for i in range(6):
             x = margin + i * (w - 2*margin) / 5
             y = h - margin - i * (h - 2*margin) / 5
             
-            self.curve_canvas.create_line(x, h-margin, x, margin, fill='#333', width=1, dash=(2, 4))
-            self.curve_canvas.create_line(margin, y, w-margin, y, fill='#333', width=1, dash=(2, 4))
+            self.curve_canvas.create_line(x, h-margin, x, margin, fill='#333', width=1, dash=(2, 4), tags="background")
+            self.curve_canvas.create_line(margin, y, w-margin, y, fill='#333', width=1, dash=(2, 4), tags="background")
             
             if i % 2 == 0:
                 val = i / 5
                 self.curve_canvas.create_text(x, h-margin+10, text=f"{val:.1f}", 
-                                             fill='#888', font=('Arial', 7))
+                                             fill='#888', font=('Arial', 7), tags="background")
                 self.curve_canvas.create_text(margin-10, y, text=f"{val:.1f}", 
-                                             fill='#888', font=('Arial', 7))
+                                             fill='#888', font=('Arial', 7), tags="background")
         
         # Labels
-        self.curve_canvas.create_text(w/2, h-5, text="Input", fill='#aaa', font=('Arial', 8))
-        self.curve_canvas.create_text(15, h/2, text="Out", fill='#aaa', font=('Arial', 8), angle=90)
+        self.curve_canvas.create_text(w/2, h-5, text="Input", fill='#aaa', font=('Arial', 8), tags="background")
+        self.curve_canvas.create_text(15, h/2, text="Out", fill='#aaa', font=('Arial', 8), angle=90, tags="background")
         
-        self.deadzone_line = self.curve_canvas.create_line(0, 0, 0, 0, fill='#f55', width=1, dash=(3, 3))
+        self.deadzone_line = self.curve_canvas.create_line(0, 0, 0, 0, fill='#f55', width=1, dash=(3, 3), tags="background")
     
     def update_spline(self):
         if len(self.control_points) >= 2:
@@ -393,6 +537,7 @@ class MouseToGamepadGUI:
                                                    bounds_error=False, fill_value='extrapolate')
     
     def draw_curve(self):
+        # Don't delete background elements
         self.curve_canvas.delete("curve")
         self.curve_canvas.delete("points")
         
@@ -468,6 +613,8 @@ class MouseToGamepadGUI:
             self.draw_curve()
     
     def on_curve_release(self, event):
+        if self.selected_point is not None:
+            self.schedule_auto_save()
         self.selected_point = None
     
     def load_preset(self, preset_name):
@@ -482,6 +629,7 @@ class MouseToGamepadGUI:
         
         self.update_spline()
         self.draw_curve()
+        self.schedule_auto_save()
     
     def apply_response_curve(self, value):
         abs_value = abs(value)
@@ -503,19 +651,39 @@ class MouseToGamepadGUI:
         
         return sign * result
     
+    def apply_smoothing(self, current_x, current_y):
+        """Apply exponential smoothing to joystick values"""
+        smooth_factor = self.smoothing.get()
+        
+        # Invert the factor so higher values = more smoothing
+        # This feels more intuitive to users
+        alpha = 1.0 - smooth_factor  # alpha is the weight for new values
+        
+        # Exponential moving average
+        # Higher smoothing value = slower response (more smoothing)
+        self.smooth_x = self.smooth_x * smooth_factor + current_x * alpha
+        self.smooth_y = self.smooth_y * smooth_factor + current_y * alpha
+        
+        return self.smooth_x, self.smooth_y
+    
     def on_axis_toggle(self):
         self.draw_joystick_background()
         
         if not self.x_axis_enabled.get():
             self.joystick_x = 0
             self.raw_x = 0
+            self.smooth_x = 0  # Reset smoothing buffer
         if not self.y_axis_enabled.get():
             self.joystick_y = 0
             self.raw_y = 0
+            self.smooth_y = 0  # Reset smoothing buffer
+            
+        self.schedule_auto_save()
     
     def adjust_sensitivity(self, delta):
         new_val = max(2, min(100, self.sensitivity.get() + delta))
         self.sensitivity.set(new_val)
+        self.schedule_auto_save()
     
     def toggle_control(self):
         if not self.running:
@@ -541,6 +709,10 @@ class MouseToGamepadGUI:
         
         self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
         self.gamepad.update()
+        
+        # Reset smoothing buffers when stopping
+        self.smooth_x = 0.0
+        self.smooth_y = 0.0
         
         if self.keyboard_listener:
             self.keyboard_listener.stop()
@@ -578,6 +750,7 @@ class MouseToGamepadGUI:
             pass
     
     def control_loop(self):
+        """Improved control loop with jump detection"""
         pyautogui.MINIMUM_DURATION = 0
         pyautogui.MINIMUM_SLEEP = 0
         pyautogui.PAUSE = 0
@@ -585,12 +758,28 @@ class MouseToGamepadGUI:
         pyautogui.moveTo(self.center_x, self.center_y)
         self.last_mx, self.last_my = self.center_x, self.center_y
         
+        # Add flags for recentering detection
+        skip_next_frame = False
+        recenter_threshold = 200  # Distance from center before recentering
+        jump_threshold = 50  # Movement larger than this is likely a recenter jump
+        
         while self.running:
             if not self.paused:
                 mx, my = pyautogui.position()
                 
+                # Calculate raw deltas
                 dx = mx - self.last_mx
                 dy = my - self.last_my
+                
+                # Detect if this is likely a recentering jump
+                movement_magnitude = (dx**2 + dy**2)**0.5
+                
+                # Skip this frame if we just recentered OR if we detect a suspicious jump
+                if skip_next_frame or movement_magnitude > jump_threshold:
+                    skip_next_frame = False
+                    self.last_mx, self.last_my = mx, my
+                    time.sleep(0.005)
+                    continue
                 
                 self.last_mx, self.last_my = mx, my
                 
@@ -602,11 +791,11 @@ class MouseToGamepadGUI:
                     self.raw_x *= decay
                     self.raw_x = max(-1.0, min(1.0, self.raw_x))
                     
-                    self.joystick_x = self.apply_response_curve(self.raw_x)
+                    joystick_x = self.apply_response_curve(self.raw_x)
                     if self.invert_x.get():
-                        self.joystick_x = -self.joystick_x
+                        joystick_x = -joystick_x
                 else:
-                    self.joystick_x = 0
+                    joystick_x = 0
                     self.raw_x = 0
                 
                 if self.y_axis_enabled.get():
@@ -614,21 +803,27 @@ class MouseToGamepadGUI:
                     self.raw_y *= decay
                     self.raw_y = max(-1.0, min(1.0, self.raw_y))
                     
-                    self.joystick_y = self.apply_response_curve(-self.raw_y)
+                    joystick_y = self.apply_response_curve(-self.raw_y)
                     if self.invert_y.get():
-                        self.joystick_y = -self.joystick_y
+                        joystick_y = -joystick_y
                 else:
-                    self.joystick_y = 0
+                    joystick_y = 0
                     self.raw_y = 0
                 
+                # Apply smoothing to the final output
+                self.joystick_x, self.joystick_y = self.apply_smoothing(joystick_x, joystick_y)
+                
                 self.gamepad.left_joystick_float(x_value_float=self.joystick_x, 
-                                                 y_value_float=self.joystick_y)
+                                                y_value_float=self.joystick_y)
                 self.gamepad.update()
                 
+                # Check if we need to recenter
                 dist_from_center = ((mx - self.center_x) ** 2 + (my - self.center_y) ** 2) ** 0.5
-                if dist_from_center > 200:
+                if dist_from_center > recenter_threshold:
+                    # Set flag to skip next frame
+                    skip_next_frame = True
                     pyautogui.moveTo(self.center_x, self.center_y)
-                    self.last_mx, self.last_my = self.center_x, self.center_y
+                    # Don't update last_mx/my here - let the next frame do it
             
             time.sleep(0.005)
         
@@ -636,36 +831,54 @@ class MouseToGamepadGUI:
         self.gamepad.update()
     
     def update_display(self):
-        # Update joystick visualization
-        x_pos = 90 + self.joystick_x * 80
-        y_pos = 90 - self.joystick_y * 80
-        
-        self.joystick_canvas.coords(self.joystick_dot, x_pos-5, y_pos-5, x_pos+5, y_pos+5)
-        
-        self.x_label.config(text=f"X: {self.joystick_x:+.2f}")
-        self.y_label.config(text=f"Y: {self.joystick_y:+.2f}")
-        
-        magnitude = (self.joystick_x**2 + self.joystick_y**2)**0.5
-        if magnitude < 0.1:
-            color = '#0f0'
-        elif magnitude < 0.5:
-            color = '#ff0'
-        elif magnitude < 0.8:
-            color = '#f80'
-        else:
-            color = '#f00'
-        
-        self.joystick_canvas.itemconfig(self.joystick_dot, fill=color)
-        
-        self.sens_value.config(text=f"{self.sensitivity.get():.0f}")
-        self.decay_value.config(text=f"{self.decay_rate.get():.2f}")
-        self.dead_value.config(text=f"{self.deadzone.get():.2f}")
+        """Update the GUI display elements"""
+        # Only update if GUI elements exist (prevents errors during initialization)
+        try:
+            # Update joystick visualization
+            x_pos = 90 + self.joystick_x * 80
+            y_pos = 90 - self.joystick_y * 80
+            
+            self.joystick_canvas.coords(self.joystick_dot, x_pos-5, y_pos-5, x_pos+5, y_pos+5)
+            
+            self.x_label.config(text=f"X: {self.joystick_x:+.2f}")
+            self.y_label.config(text=f"Y: {self.joystick_y:+.2f}")
+            
+            magnitude = (self.joystick_x**2 + self.joystick_y**2)**0.5
+            if magnitude < 0.1:
+                color = '#0f0'
+            elif magnitude < 0.5:
+                color = '#ff0'
+            elif magnitude < 0.8:
+                color = '#f80'
+            else:
+                color = '#f00'
+            
+            self.joystick_canvas.itemconfig(self.joystick_dot, fill=color)
+            
+            # Update parameter value displays
+            if hasattr(self, 'sens_value'):
+                self.sens_value.config(text=f"{self.sensitivity.get():.0f}")
+            if hasattr(self, 'decay_value'):
+                self.decay_value.config(text=f"{self.decay_rate.get():.2f}")
+            if hasattr(self, 'dead_value'):
+                self.dead_value.config(text=f"{self.deadzone.get():.2f}")
+            if hasattr(self, 'smooth_value'):
+                self.smooth_value.config(text=f"{self.smoothing.get():.2f}")
+            
+            # Update deadzone line position
+            if hasattr(self, 'curve_canvas'):
+                self.draw_curve()
+                
+        except (AttributeError, tk.TclError):
+            # GUI not ready yet, skip this update
+            pass
         
         self.root.after(16, self.update_display)
     
     def on_closing(self):
         if self.running:
             self.stop_control()
+        self.save_settings()  # Final save on exit
         self.gamepad.reset()
         self.root.destroy()
 
