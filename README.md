@@ -178,3 +178,10 @@ This tool is intended for single-player games and personal use. Using input conv
 ---
 
 **Note**: This tool modifies input methods and creates virtual devices. Use at your own discretion and ensure compatibility with your intended applications.
+
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
+
+This software is provided "as is", without warranty of any kind. Use at your own risk.
