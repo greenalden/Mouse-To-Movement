@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 
+pyautogui.FAILSAFE = False
+
 class MouseToGamepadGUI:
     def __init__(self, root):
         self.root = root
